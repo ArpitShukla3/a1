@@ -1,0 +1,28 @@
+# DESIGN
+
+## Domain model
+Problem (requirements, constraints, skillIds) → Attempt (DRAFT→SUBMITTED→EVALUATING→COMPLETED/FAILED, submissionVersion) → Submission (versioned content) → Evaluation (per-skill results + aggregate + feedback) → SkillObservation → LearnerSkillProfile. Skill = {id, name, description, criteria, scenarios, grounding examples, version}. SubmissionContent is a discriminated union (`kind:'text'` now); future `diagram`/`code` kinds add a variant without touching Attempt/Evaluation.
+
+## Orchestrator pipeline
+`EvaluationOrchestrator.run()` owns everything after ONE complete solution is persisted: SkillSelector (skills from the problem's evaluation profile — frontend never knows this) → ScenarioBuilder (same complete solution + primary curated scenario per skill; grounding attached in the prompt builder) → EvaluationRunner (linear on Ollama, concurrency-capped + streaming hooks) → ResultAggregator (deterministic: totals, strongest/weakest, avg confidence, priority improvements) → LearnerProgressUpdater (observations) → EvaluationEventPublisher (SSE). Domain boundary: frontend = practice interface + renderer; backend = evaluation intelligence; skills = backend lenses; scenarios = backend probes; LLM = backend infrastructure. The frontend holds no prompts, no scenarios, no skill config — names/scenario text arrive inside results and `GET /api/skills`.
+
+## Evaluation architecture
+`Evaluator.evaluate(task, onToken?): Promise<SkillEvaluationResult>`; `LLMProvider.generate(prompt, onToken?): Promise<string>`. `SkillEvaluator` builds one prompt per skill (skill + scenario + criteria + grounding + submission), calls the provider streaming tokens through `onToken`, parses JSON via `parseSkillJson` (never throws; garbage → `insufficient evidence`, score ≤ 2). `EvaluationRunner.run(tasks, hooks)` walks tasks in waves (Ollama `OLLAMA_CONCURRENCY=1` = strictly one at a time), firing per-task hooks (`onStarted`/`onToken`/`onCompleted`/`onFailed`) so each skill streams live without waiting for the rest. Domain code only sees these interfaces — Mock/Ollama/Claude are interchangeable. Claude Batch API later: `ClaudeProvider.batchItems()` already emits `{custom_id: taskId, prompt}` for correlation; swap the runner body to submit/poll the batch endpoint. Ollama model configurable via `OLLAMA_*`.
+
+## Skills & scenarios
+8 MVP skills (v1.0.0, maxScore 5): requirement_understanding, responsibility_design, coupling_cohesion, abstraction_encapsulation, extensibility, scalability, failure_handling, edge_cases_testability. Each carries criteria + 2 curated scenarios (primary used per evaluation, e.g. scalability: "100x growth?" then bottleneck analysis; failure: "dependency fails halfway?" then safe retry; extensibility: "new type introduced?" then new rule/workflow) + good/bad grounding examples. Prompts state grounding examples are references, not answers; multiple valid designs allowed; every concern must quote candidate evidence. The same grounding examples ship back inside each `SkillEvaluationResult`, so the UI can show every failure next to a concrete "where designs like this fail" example and every suggestion next to a "better shape" example.
+
+## Deterministic vs AI
+Deterministic: required fields, empty submission, valid problem/attempt, state transitions, idempotency (`evaluationJobId = attemptId:vVersion`), format validation, profile math. AI: responsibilities, coupling/cohesion, abstraction, SOLID, trade-offs, scenario analysis, explanation quality, suggestions.
+
+## Async evaluation + streaming
+`POST /attempts/:id/submit {solution}` is the single entry point: optional solution is validated + persisted first (same rules as autosave `PUT`), then SUBMITTED → `setImmediate(run)` → 202. Run sets EVALUATING, evaluates skills linearly on Ollama (`OLLAMA_CONCURRENCY=1`; on remote providers fully parallel), aggregates, saves Evaluation, appends SkillObservations, sets COMPLETED; on AI error saves FAILED (submission intact) for retry. Duplicate job IDs reuse COMPLETED — no double evaluation. Progress streams over SSE (`GET /api/attempts/:id/evaluation-events`): `evaluation.started` → `skill.started` → `skill.token`* (raw model tokens forwarded live per skill) → `skill.completed/failed` → `evaluation.completed/failed`, with per-job replay log for reconnects. A failed skill emits `skill.failed` (message only, retryable) and fails the job — no partial aggregates, no stack traces. Frontend renders skills as they arrive as chat bubbles (analyzing → live raw tokens → full structured result), with polling as fallback.
+
+## Learner skill memory
+In-memory observations per (learner, skill) across problems. `computeProfile` deterministically derives average, recent average (last 3), trend (last vs older mean, ±0.05), recurring tags (count ≥ 2). LLM never computes trends. Appreciation is deterministic too: the orchestrator compares each score against the learner's pre-run average per skill and writes `feedback.celebrations` ("Scalability up from 2.7 to 4.0 — keep it up") — no LLM involved. Example: Parking Lot 2/5, Elevator 4/5, Vending 3/5 → average 0.6, trend from sequence.
+
+## Extensibility
+New skill: add to `src/data/skills.ts` + problem `skillIds`. New submission kind: extend `SubmissionContent` union. New provider: implement `LLMProvider`. Batch/async infra later without touching domain.
+
+## Trade-offs
+In-memory = no persistence across restarts (acceptable for 2-day MVP; repos are interfaces, swap later). `setImmediate` instead of a queue = no durability under crash (submission still saved; retry re-runs). Mock scoring is heuristic (length/keywords) — only for offline demo, clearly separated from deterministic aggregation.
